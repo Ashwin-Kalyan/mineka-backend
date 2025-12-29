@@ -5,206 +5,464 @@ from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+import logging
+import json
 
-# Load environment variables from .env file
-# This will look for .env in the current directory and parent directories
-env_path = os.path.join(os.path.dirname(__file__), '.env')
-if os.path.exists(env_path):
-    load_dotenv(env_path)
-    print(f"✓ Loaded environment variables from {env_path}")
-else:
-    # Try loading from current directory (for when running from different locations)
+# Configure logging for gunicorn
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables from .env file (for local development only)
+# On Render, we use environment variables from dashboard
+if os.path.exists('.env'):
     load_dotenv()
-    if not os.path.exists('.env'):
-        print("⚠ Warning: .env file not found. Make sure to create one with your configuration.")
+    logger.info("✓ Loaded .env file for local development")
+else:
+    logger.info("ℹ Running on Render - using environment variables from dashboard")
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# Configure CORS - allow all origins for simplicity
+# You can restrict this to your Wix domain in production
+CORS(app)
+logger.info("CORS configured for all origins")
 
 # Google Sheets configuration
 SCOPE = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file"
 ]
 
-def get_google_sheets_client():
-    """Initialize and return Google Sheets client"""
-    import json
-    
-    # Try to get credentials from file path first (preferred method)
-    creds_path = os.getenv('GOOGLE_CREDENTIALS_PATH')
-    if creds_path:
-        if not os.path.exists(creds_path):
-            raise FileNotFoundError(f"Credentials file not found: {creds_path}")
-        credentials = Credentials.from_service_account_file(creds_path, scopes=SCOPE)
-        return gspread.authorize(credentials)
-    
-    # Fallback to JSON string from environment variable
-    creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-    if creds_json:
-        creds_dict = json.loads(creds_json)
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
-        return gspread.authorize(credentials)
-    
-    raise ValueError(
-        "Google credentials not found. Please set either GOOGLE_CREDENTIALS_PATH "
-        "(path to JSON file) or GOOGLE_CREDENTIALS_JSON (JSON string) in your .env file"
-    )
+# Define the Render secret file path
+RENDER_SECRETS_PATH = '/etc/secrets/credentials.json'
 
-@app.route('/api/booking', methods=['POST'])
+def get_google_sheets_client():
+    """Initialize and return Google Sheets client for Render"""
+    try:
+        # Priority 1: Check for Render secret file (your specific case)
+        if os.path.exists(RENDER_SECRETS_PATH):
+            logger.info(f"✓ Using credentials from Render secret file: {RENDER_SECRETS_PATH}")
+            
+            # Verify the file is readable and contains valid JSON
+            try:
+                with open(RENDER_SECRETS_PATH, 'r') as f:
+                    creds_content = f.read()
+                    # Validate JSON
+                    json.loads(creds_content)
+                
+                credentials = Credentials.from_service_account_file(RENDER_SECRETS_PATH, scopes=SCOPE)
+                client = gspread.authorize(credentials)
+                
+                # Test the credentials by getting the email
+                service_account_email = credentials.service_account_email
+                logger.info(f"✓ Authenticated as service account: {service_account_email}")
+                
+                return client
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"✗ Invalid JSON in secret file: {e}")
+                raise ValueError(f"Invalid JSON in {RENDER_SECRETS_PATH}")
+            except Exception as e:
+                logger.error(f"✗ Error reading secret file: {e}")
+                raise
+        
+        # Priority 2: Check for GOOGLE_CREDENTIALS_JSON environment variable (fallback)
+        creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+        if creds_json:
+            logger.info("✓ Using GOOGLE_CREDENTIALS_JSON from environment")
+            try:
+                creds_dict = json.loads(creds_json)
+                credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPE)
+                client = gspread.authorize(credentials)
+                logger.info(f"✓ Authenticated as: {credentials.service_account_email}")
+                return client
+            except json.JSONDecodeError as e:
+                logger.error(f"✗ Invalid JSON in GOOGLE_CREDENTIALS_JSON: {e}")
+                raise ValueError("Invalid JSON in GOOGLE_CREDENTIALS_JSON")
+        
+        # Priority 3: Check for GOOGLE_CREDENTIALS_PATH (local development)
+        creds_path = os.getenv('GOOGLE_CREDENTIALS_PATH', './credentials.json')
+        if os.path.exists(creds_path):
+            logger.info(f"✓ Using local credentials file: {creds_path}")
+            credentials = Credentials.from_service_account_file(creds_path, scopes=SCOPE)
+            client = gspread.authorize(credentials)
+            logger.info(f"✓ Authenticated as: {credentials.service_account_email}")
+            return client
+        
+        # No credentials found
+        error_msg = (
+            "❌ Google credentials not found!\n\n"
+            "On Render:\n"
+            f"1. Upload your credentials.json to: {RENDER_SECRETS_PATH}\n"
+            "   OR set GOOGLE_CREDENTIALS_JSON environment variable\n\n"
+            "Locally:\n"
+            "1. Create a .env file with GOOGLE_CREDENTIALS_PATH\n"
+            "2. Or place credentials.json in the project root\n"
+        )
+        logger.error(error_msg)
+        raise ValueError("Google credentials configuration missing")
+    
+    except Exception as e:
+        logger.error(f"✗ Failed to initialize Google Sheets client: {e}", exc_info=True)
+        raise
+
+@app.route('/api/booking', methods=['POST', 'OPTIONS'])
 def submit_booking():
-    """Handle booking form submissions"""
+    """Handle booking form submissions from Wix"""
+    # Handle preflight requests for CORS
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     try:
         data = request.get_json()
         
+        if not data:
+            logger.error("No JSON data received in request")
+            return jsonify({'error': 'No JSON data received'}), 400
+        
+        logger.info(f"📥 Received booking request: {data}")
+        
         # Validate required fields
         required_fields = ['name', 'phone', 'time', 'location']
-        for field in required_fields:
-            if not data.get(field):
-                return jsonify({'error': f'Missing required field: {field}'}), 400
+        missing_fields = [field for field in required_fields if not data.get(field)]
+        
+        if missing_fields:
+            logger.warning(f"Missing fields: {missing_fields}")
+            return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
         
         # Get Google Sheets client
+        logger.info("🔐 Initializing Google Sheets client...")
         gc = get_google_sheets_client()
         
-        # Open the spreadsheet (use the spreadsheet ID from .env)
+        # Get spreadsheet ID from environment
         spreadsheet_id = os.getenv('GOOGLE_SPREADSHEET_ID')
         if not spreadsheet_id:
+            logger.error("GOOGLE_SPREADSHEET_ID not set in environment")
             return jsonify({'error': 'Google Spreadsheet ID not configured'}), 500
         
-        # Remove any fragment identifier (#gid=0) from the spreadsheet ID
+        # Clean the spreadsheet ID
         spreadsheet_id = spreadsheet_id.split('#')[0].strip()
+        logger.info(f"📊 Using spreadsheet ID: {spreadsheet_id}")
         
         try:
+            logger.info(f"🔍 Opening spreadsheet...")
             spreadsheet = gc.open_by_key(spreadsheet_id)
+            logger.info("✅ Successfully opened spreadsheet")
+            
+            # Get the service account email for sharing instructions
+            credentials = gc.auth.credentials
+            service_email = credentials.service_account_email
+            logger.info(f"👤 Service account: {service_email}")
+            
         except Exception as e:
             error_msg = str(e)
-            error_type = type(e).__name__
+            logger.error(f"❌ Failed to open spreadsheet: {error_msg}")
             
-            # Get the service account email for better error message
+            # Try to get service email from credentials
             try:
-                import json
-                creds_path = os.getenv('GOOGLE_CREDENTIALS_PATH')
-                if creds_path and os.path.exists(creds_path):
-                    with open(creds_path, 'r') as f:
-                        creds_data = json.load(f)
-                        service_email = creds_data.get('client_email', 'your service account email')
-                else:
-                    service_email = 'mineka-google-sheets@nortiq-mineka-hokkaido.iam.gserviceaccount.com'
+                credentials = gc.auth.credentials
+                service_email = credentials.service_account_email
             except:
-                service_email = 'mineka-google-sheets@nortiq-mineka-hokkaido.iam.gserviceaccount.com'
+                service_email = "mineka-google-sheets@nortiq-mineka-hokkaido.iam.gserviceaccount.com"
             
-            # Check if it's an API not enabled error
-            if 'API has not been used' in error_msg or 'SERVICE_DISABLED' in error_msg or 'sheets.googleapis.com' in error_msg:
+            # User-friendly error messages
+            if 'API has not been used' in error_msg or 'SERVICE_DISABLED' in error_msg:
                 return jsonify({
-                    'error': 'Google Sheets API is not enabled. Please enable it:\n\n1. Go to: https://console.cloud.google.com/apis/library/sheets.googleapis.com\n2. Select your project (nortiq-mineka-hokkaido)\n3. Click "Enable"\n4. Wait a few minutes for it to activate\n5. Also enable Google Drive API: https://console.cloud.google.com/apis/library/drive.googleapis.com'
+                    'error': 'Google Sheets API is not enabled. Please enable it:\n\n'
+                            '1. Go to: https://console.cloud.google.com/apis/library/sheets.googleapis.com\n'
+                            '2. Select your project (nortiq-mineka-hokkaido)\n'
+                            '3. Click "Enable"\n'
+                            '4. Also enable Google Drive API: https://console.cloud.google.com/apis/library/drive.googleapis.com'
                 }), 403
             
-            if 'Permission' in error_msg or 'permission' in error_msg or '403' in error_msg or error_type == 'PermissionError':
+            if 'Permission' in error_msg or 'permission' in error_msg or '403' in error_msg:
+                share_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
                 return jsonify({
-                    'error': f'Permission denied. Please share your Google Spreadsheet with this email: {service_email}\n\nSteps:\n1. Open your Google Spreadsheet\n2. Click "Share" button\n3. Add this email: {service_email}\n4. Give it "Editor" access\n5. Click "Send"'
+                    'error': f'Permission denied. Please share your Google Spreadsheet with this email:\n\n'
+                            f'📧 {service_email}\n\n'
+                            f'Steps:\n'
+                            f'1. Open your spreadsheet: {share_url}\n'
+                            f'2. Click "Share" button (top-right)\n'
+                            f'3. Add email: {service_email}\n'
+                            f'4. Set as "Editor"\n'
+                            f'5. Click "Send"'
                 }), 403
-            raise
+            
+            if 'not found' in error_msg.lower():
+                return jsonify({
+                    'error': f'Spreadsheet not found. Check your GOOGLE_SPREADSHEET_ID:\n\n{spreadsheet_id}'
+                }), 404
+            
+            return jsonify({'error': f'Failed to access spreadsheet: {error_msg}'}), 500
         
-        # Use the first worksheet (Sheet1) or create Bookings if it doesn't exist
+        # Use or create 'Bookings' worksheet
         try:
             worksheet = spreadsheet.worksheet('Bookings')
+            logger.info("📝 Using existing 'Bookings' worksheet")
         except gspread.exceptions.WorksheetNotFound:
-            # Try to use the first sheet if Bookings doesn't exist
             try:
-                worksheet = spreadsheet.sheet1  # Get the first sheet
-            except:
-                # Create a new worksheet if no sheets exist
+                # Try to use the first sheet
+                worksheet = spreadsheet.get_worksheet(0)
+                if worksheet.title == 'Sheet1':
+                    worksheet.update_title('Bookings')
+                logger.info("📝 Using first worksheet (renamed to 'Bookings')")
+            except Exception as e:
+                # Create a new worksheet
+                logger.info("📝 Creating new 'Bookings' worksheet")
                 worksheet = spreadsheet.add_worksheet(title='Bookings', rows=1000, cols=10)
         
-        # Check if headers exist, if not add them
+        # Check and ensure headers exist
         try:
             existing_headers = worksheet.row_values(1)
-            if not existing_headers or len(existing_headers) == 0 or existing_headers[0] != 'Name':
-                # Add headers if they don't exist or are wrong
-                if existing_headers and len(existing_headers) > 0:
-                    # Headers exist but wrong, update them
-                    worksheet.update('A1:D1', [['Name', 'Phone Number', 'When', 'Where']])
-                else:
-                    # No headers, add them
-                    worksheet.append_row(['Name', 'Phone Number', 'When', 'Where'])
+            expected_headers = ['Name', 'Phone Number', 'When', 'Where', 'Timestamp', 'IP Address']
+            
+            if not existing_headers or existing_headers[0] != 'Name':
+                logger.info("📋 Adding headers to worksheet")
+                worksheet.update('A1:F1', [expected_headers])
         except Exception as header_error:
-            print(f"Warning: Could not check/update headers: {str(header_error)}")
+            logger.warning(f"Could not check/update headers: {header_error}")
             # Try to add headers anyway
             try:
-                worksheet.append_row(['Name', 'Phone Number', 'When', 'Where'])
+                worksheet.append_row(expected_headers)
             except:
                 pass
         
-        # Prepare the row data (matching the column order: Name, Phone Number, When, Where)
+        # Prepare row data with timestamp and IP
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ip_address = request.remote_addr
         row_data = [
             data['name'],
             data['phone'],
             data['time'],
-            data['location']
+            data['location'],
+            timestamp,
+            ip_address
         ]
         
-        # Append the row to the spreadsheet
+        # Append the row
+        logger.info(f"✍️ Appending row: {row_data}")
         try:
             worksheet.append_row(row_data, value_input_option='USER_ENTERED')
-            print(f"✓ Successfully appended row to spreadsheet: {row_data}")
+            logger.info("✅ Successfully saved booking to Google Sheets")
+            
+            # Get the row number for reference
+            all_values = worksheet.get_all_values()
+            row_number = len(all_values)
+            
+            return jsonify({
+                'success': True,
+                'message': 'Booking submitted successfully! ✅',
+                'timestamp': timestamp,
+                'row_number': row_number,
+                'spreadsheet_url': f'https://docs.google.com/spreadsheets/d/{spreadsheet_id}'
+            }), 200
+            
         except Exception as append_error:
-            print(f"✗ Error appending row: {str(append_error)}")
-            import traceback
-            traceback.print_exc()
-            raise
-        
-        return jsonify({
-            'success': True,
-            'message': 'Booking submitted successfully'
-        }), 200
+            logger.error(f"❌ Error appending row: {append_error}", exc_info=True)
+            return jsonify({'error': f'Failed to save booking: {str(append_error)}'}), 500
         
     except Exception as e:
-        import traceback
-        error_msg = str(e) if str(e) else f"Unknown error: {type(e).__name__}"
-        print(f"Error processing booking: {error_msg}")
-        print(f"Traceback: {traceback.format_exc()}")
-        return jsonify({'error': error_msg}), 500
+        logger.error(f"💥 Unexpected error in submit_booking: {str(e)}", exc_info=True)
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
-    return jsonify({'status': 'ok'}), 200
+    """Health check endpoint for Render monitoring"""
+    try:
+        # Check if secret file exists
+        secret_file_exists = os.path.exists(RENDER_SECRETS_PATH)
+        
+        # Check spreadsheet ID
+        spreadsheet_id = os.getenv('GOOGLE_SPREADSHEET_ID', 'Not set')
+        has_spreadsheet_id = bool(spreadsheet_id and spreadsheet_id.strip())
+        
+        # Try to initialize Google Sheets client (but don't fail if it doesn't work)
+        sheets_status = 'unknown'
+        service_email = 'unknown'
+        
+        try:
+            gc = get_google_sheets_client()
+            credentials = gc.auth.credentials
+            service_email = credentials.service_account_email
+            sheets_status = 'connected'
+        except Exception as e:
+            sheets_status = f'error: {str(e)[:100]}'
+        
+        return jsonify({
+            'status': 'healthy',
+            'service': 'mineka-booking-api',
+            'environment': os.getenv('RENDER', 'local'),
+            'timestamp': datetime.now().isoformat(),
+            'config': {
+                'secret_file_exists': secret_file_exists,
+                'secret_file_path': RENDER_SECRETS_PATH,
+                'spreadsheet_id_set': has_spreadsheet_id,
+                'google_sheets_status': sheets_status,
+                'service_account_email': service_email
+            }
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'service': 'mineka-booking-api',
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+@app.route('/api/config', methods=['GET'])
+def config_check():
+    """Check configuration without connecting to Google"""
+    secret_file_exists = os.path.exists(RENDER_SECRETS_PATH)
+    spreadsheet_id = os.getenv('GOOGLE_SPREADSHEET_ID', 'Not set')
+    
+    # Check if secret file has valid JSON
+    secret_valid = False
+    if secret_file_exists:
+        try:
+            with open(RENDER_SECRETS_PATH, 'r') as f:
+                content = f.read()
+                creds = json.loads(content)
+                secret_valid = True
+                service_email = creds.get('client_email', 'Unknown')
+        except:
+            service_email = 'Invalid JSON'
+    else:
+        service_email = 'File not found'
+    
+    return jsonify({
+        'render_secrets_file': {
+            'path': RENDER_SECRETS_PATH,
+            'exists': secret_file_exists,
+            'valid': secret_valid,
+            'service_email': service_email
+        },
+        'spreadsheet_id': spreadsheet_id,
+        'environment': os.getenv('RENDER_ENV', 'unknown'),
+        'port': os.getenv('PORT', 'Not set')
+    })
+
+@app.route('/api/test-connection', methods=['GET'])
+def test_connection():
+    """Test Google Sheets connection"""
+    try:
+        gc = get_google_sheets_client()
+        spreadsheet_id = os.getenv('GOOGLE_SPREADSHEET_ID')
+        
+        if not spreadsheet_id:
+            return jsonify({'error': 'No spreadsheet ID configured'}), 400
+        
+        spreadsheet_id = spreadsheet_id.split('#')[0].strip()
+        
+        # Try to open the spreadsheet
+        spreadsheet = gc.open_by_key(spreadsheet_id)
+        credentials = gc.auth.credentials
+        
+        return jsonify({
+            'success': True,
+            'service_account': credentials.service_account_email,
+            'spreadsheet_title': spreadsheet.title,
+            'spreadsheet_id': spreadsheet_id,
+            'sheets': [ws.title for ws in spreadsheet.worksheets()],
+            'message': '✅ Connection successful!'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': '❌ Connection failed'
+        }), 500
+
+@app.route('/api/test', methods=['GET'])
+def test_endpoint():
+    """Simple test endpoint"""
+    return jsonify({
+        'message': 'Mineka Booking API is running! 🚀',
+        'status': 'ok',
+        'timestamp': datetime.now().isoformat(),
+        'deployment': 'Render',
+        'secrets_path': RENDER_SECRETS_PATH,
+        'secrets_exists': os.path.exists(RENDER_SECRETS_PATH),
+        'endpoints': {
+            'POST /api/booking': 'Submit booking',
+            'GET /api/health': 'Health check',
+            'GET /api/config': 'Configuration check',
+            'GET /api/test-connection': 'Test Google Sheets connection'
+        }
+    })
+
+@app.route('/')
+def index():
+    """Root endpoint with API information"""
+    return jsonify({
+        'name': 'Mineka Booking API',
+        'description': 'Backend API for Mineka booking system connected to Google Sheets',
+        'version': '1.0.0',
+        'deployment': 'Render',
+        'secrets_config': 'Using /etc/secrets/credentials.json',
+        'documentation': 'See the /api/test endpoint for available endpoints',
+        'health_check': '/api/health',
+        'repo': 'https://github.com/yourusername/mineka-booking-api'
+    })
 
 def validate_env_config():
-    """Validate that required environment variables are set"""
-    errors = []
+    """Validate configuration on startup"""
+    logger.info("🔍 Validating configuration...")
     
-    # Check for credentials (either path or JSON)
-    creds_path = os.getenv('GOOGLE_CREDENTIALS_PATH')
-    creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-    
-    if not creds_path and not creds_json:
-        errors.append("Missing GOOGLE_CREDENTIALS_PATH or GOOGLE_CREDENTIALS_JSON")
-    elif creds_path and not os.path.exists(creds_path):
-        errors.append(f"Credentials file not found: {creds_path}")
+    # Check for secrets file
+    if os.path.exists(RENDER_SECRETS_PATH):
+        logger.info(f"✅ Found secrets file at: {RENDER_SECRETS_PATH}")
+        
+        # Validate JSON
+        try:
+            with open(RENDER_SECRETS_PATH, 'r') as f:
+                creds = json.load(f)
+                email = creds.get('client_email', 'Unknown')
+                logger.info(f"✅ Valid JSON, service account: {email}")
+        except json.JSONDecodeError:
+            logger.error(f"❌ Invalid JSON in {RENDER_SECRETS_PATH}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error reading secrets file: {e}")
+            return False
+    else:
+        logger.warning(f"⚠ Secrets file not found at: {RENDER_SECRETS_PATH}")
+        logger.info("ℹ Will try environment variable GOOGLE_CREDENTIALS_JSON instead")
     
     # Check for spreadsheet ID
-    if not os.getenv('GOOGLE_SPREADSHEET_ID'):
-        errors.append("Missing GOOGLE_SPREADSHEET_ID")
-    
-    if errors:
-        print("\n❌ Configuration errors found:")
-        for error in errors:
-            print(f"  - {error}")
-        print("\nPlease check your .env file and ensure all required variables are set.")
-        print("See README.md for setup instructions.\n")
+    spreadsheet_id = os.getenv('GOOGLE_SPREADSHEET_ID')
+    if spreadsheet_id:
+        logger.info(f"✅ Spreadsheet ID is set: {spreadsheet_id[:15]}...")
+    else:
+        logger.error("❌ GOOGLE_SPREADSHEET_ID is not set")
         return False
     
-    print("✓ Environment configuration validated")
+    logger.info("✅ Configuration validation complete")
     return True
 
+# Gunicorn logging integration
+if __name__ != '__main__':
+    gunicorn_logger = logging.getLogger('gunicorn.error')
+    app.logger.handlers = gunicorn_logger.handlers
+    app.logger.setLevel(gunicorn_logger.level)
+
 if __name__ == '__main__':
-    # Validate configuration before starting
+    # Validate configuration
     if not validate_env_config():
-        print("Server not started due to configuration errors.")
+        logger.error("❌ Server startup aborted due to configuration errors")
         exit(1)
     
     port = int(os.getenv('PORT', 3000))
-    print(f"🚀 Starting server on http://0.0.0.0:{port}")
-    app.run(debug=True, host='0.0.0.0', port=port)
-
+    
+    logger.info(f"""
+    🚀 Starting Mineka Booking API
+    ═════════════════════════════════════
+    📍 Port: {port}
+    🔐 Secrets: {RENDER_SECRETS_PATH}
+    📊 Spreadsheet: {os.getenv('GOOGLE_SPREADSHEET_ID', 'Not set')[:20]}...
+    🌐 Environment: {os.getenv('RENDER', 'Local Development')}
+    ═════════════════════════════════════
+    """)
+    
+    # Development server (not used on Render)
+    app.run(debug=False, host='0.0.0.0', port=port)
