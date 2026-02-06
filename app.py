@@ -97,6 +97,58 @@ def submit_booking():
         print(f"Error processing booking: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/contact', methods=['POST', 'OPTIONS'])
+def submit_contact():
+    """Handle contact form submissions"""
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    try:
+        data = request.get_json() or {}
+
+        # Validate required fields (common contact form fields)
+        required_fields = ['name', 'email', 'message']
+        for field in required_fields:
+            if not data.get(field):
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+
+        gc = get_google_sheets_client()
+        spreadsheet_id = os.getenv('GOOGLE_SPREADSHEET_ID')
+        if not spreadsheet_id:
+            return jsonify({'error': 'Google Spreadsheet ID not configured'}), 500
+
+        spreadsheet_id = spreadsheet_id.split('#')[0].strip()
+        spreadsheet = gc.open_by_key(spreadsheet_id)
+
+        try:
+            worksheet = spreadsheet.worksheet('Contact')
+        except Exception:
+            worksheet = spreadsheet.add_worksheet(title='Contact', rows=1000, cols=5)
+
+        headers = worksheet.row_values(1)
+        if not headers or headers[0] != 'Name':
+            worksheet.append_row(['Name', 'Email', 'Message', 'Timestamp'])
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        row_data = [
+            data['name'],
+            data['email'],
+            data['message'],
+            timestamp,
+        ]
+        worksheet.append_row(row_data)
+
+        return jsonify({
+            'success': True,
+            'message': 'Contact form submitted successfully',
+        }), 200
+
+    except Exception as e:
+        print(f"Error processing contact: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
